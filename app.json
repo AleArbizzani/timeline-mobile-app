@@ -3,10 +3,16 @@
     "name": "timeline-app",
     "slug": "timeline-app",
     "version": "1.0.0",
+    "scheme": "timeline-app",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
+    "plugins": [
+      "expo-router",
+      "expo-font",
+      "expo-secure-store"
+    ],
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
