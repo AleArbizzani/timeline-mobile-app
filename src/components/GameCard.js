@@ -1,4 +1,4 @@
-import { Image, StyleSheet, Text, View } from 'react-native';
+import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
 import { colors, spacing, typography } from '../theme';
 
 const formatGameDate = (value) => {
@@ -26,11 +26,18 @@ const formatGameTime = (value) => {
   };
 };
 
-export default function GameCard({ leagueName, leagueIcon, dateTime, homeTeam, awayTeam }) {
+export default function GameCard({
+  leagueName,
+  leagueIcon,
+  dateTime,
+  homeTeam,
+  awayTeam,
+  onPress,
+}) {
   const { time, meridiem } = formatGameTime(dateTime);
 
   return (
-    <View style={styles.card}>
+    <Pressable style={styles.card} onPress={onPress} disabled={!onPress}>
       <View style={styles.header}>
         <View style={styles.headerLeft}>
           {leagueIcon ? (
@@ -56,7 +63,7 @@ export default function GameCard({ leagueName, leagueIcon, dateTime, homeTeam, a
           </View>
         </View>
       </View>
-    </View>
+    </Pressable>
   );
 }
 

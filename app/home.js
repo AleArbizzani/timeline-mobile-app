@@ -1,24 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
+  Alert,
   Animated,
+  AppState,
+  Dimensions,
   Keyboard,
   Modal,
+  Platform,
+  Pressable,
   ScrollView,
+  SectionList,
+  StyleSheet,
+  Switch,
   Text,
   View,
-  StyleSheet,
-  Pressable,
-  Switch,
-  Platform,
-  Alert,
-  Dimensions,
-  ActivityIndicator,
 } from 'react-native';
 import MainHeader from '../src/components/headers/MainHeader';
 import ModalHeader from '../src/components/headers/ModalHeader';
 import StepNavigationHeader from '../src/components/headers/StepNavigationHeader';
 import BottomTabBar from '../src/components/BottomTabBar';
 import GameCard from '../src/components/GameCard';
+import GameCardSkeleton from '../src/components/GameCardSkeleton';
 import PrimaryButton from '../src/components/PrimaryButton';
 import SingleLineInput from '../src/components/SingleLineInput';
 import { colors, spacing, typography } from '../src/theme';
@@ -26,10 +29,39 @@ import { supabase } from '../src/lib/supabase';
 import { Ionicons } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import { impactAsync, ImpactFeedbackStyle } from '../src/lib/haptics';
+import { useRouter } from 'expo-router';
+import MatchDetailsPlaceholder from '../src/components/MatchDetailsPlaceholder';
+
+const GAMES_CACHE_TTL_MS = 60 * 1000;
+const gamesCacheByUser = new Map();
+
+const getGamesCache = (userId) => {
+  if (!userId) {
+    return null;
+  }
+  return gamesCacheByUser.get(userId) ?? null;
+};
+
+const setGamesCache = (userId, games) => {
+  if (!userId) {
+    return;
+  }
+  gamesCacheByUser.set(userId, { games, updatedAt: Date.now() });
+};
+
+const isGamesCacheFresh = (entry) => {
+  if (!entry?.updatedAt) {
+    return false;
+  }
+  return Date.now() - entry.updatedAt < GAMES_CACHE_TTL_MS;
+};
 
 export default function HomeScreen() {
+  const router = useRouter();
   const [userId, setUserId] = useState(null);
   const [games, setGames] = useState([]);
+  const [gamesLoading, setGamesLoading] = useState(false);
+  const [gamesRefreshing, setGamesRefreshing] = useState(false);
   const [isCreateMatchOpen, setIsCreateMatchOpen] = useState(false);
   const [isOrgOpen, setIsOrgOpen] = useState(false);
   const [isLeagueOpen, setIsLeagueOpen] = useState(false);
@@ -65,6 +97,8 @@ export default function HomeScreen() {
   const [officialHasMore, setOfficialHasMore] = useState(true);
   const [officialLoading, setOfficialLoading] = useState(false);
   const [toastVisible, setToastVisible] = useState(false);
+  const [overlayMatchId, setOverlayMatchId] = useState(null);
+  const [isMatchOverlayVisible, setIsMatchOverlayVisible] = useState(false);
   const [selectedOfficials, setSelectedOfficials] = useState({
     REF: null,
     AR1: null,
@@ -79,6 +113,7 @@ export default function HomeScreen() {
 
   const { width: screenWidth } = Dimensions.get('window');
   const stepTranslateX = useRef(new Animated.Value(0)).current;
+  const matchOverlayTranslateX = useRef(new Animated.Value(screenWidth)).current;
   const keyboardAccessoryAnim = useRef(new Animated.Value(0)).current;
   const toastAnim = useRef(new Animated.Value(0)).current;
   const step1ScrollRef = useRef(null);
@@ -88,6 +123,8 @@ export default function HomeScreen() {
   const locationInputRef = useRef(null);
   const officialFetchId = useRef(0);
   const toastTimerRef = useRef(null);
+  const appStateRef = useRef(AppState.currentState);
+  const gamesRefreshingRef = useRef(false);
 
   const OFFICIALS_PAGE_SIZE = 25;
 
@@ -411,6 +448,10 @@ export default function HomeScreen() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    gamesRefreshingRef.current = gamesRefreshing;
+  }, [gamesRefreshing]);
 
   const hideToast = () => {
     if (toastTimerRef.current) {
@@ -755,14 +796,65 @@ export default function HomeScreen() {
   useEffect(() => {
     let isActive = true;
 
-    fetchGames().then((data) => {
+    const loadGames = async () => {
+      if (!userId) {
+        if (isActive) {
+          setGames([]);
+          setGamesLoading(false);
+        }
+        return;
+      }
+
+      const cacheEntry = getGamesCache(userId);
+      if (cacheEntry && isGamesCacheFresh(cacheEntry)) {
+        if (isActive) {
+          setGames(cacheEntry.games);
+          setGamesLoading(false);
+        }
+        return;
+      }
+
+      if (isActive) {
+        setGamesLoading(!cacheEntry);
+      }
+      const data = await fetchGames();
       if (isActive) {
         setGames(data);
+        setGamesLoading(false);
+        setGamesCache(userId, data);
       }
-    });
+    };
+
+    loadGames();
 
     return () => {
       isActive = false;
+    };
+  }, [userId]);
+
+  const refreshGames = async () => {
+    if (!userId || gamesRefreshingRef.current) {
+      return;
+    }
+    setGamesRefreshing(true);
+    const data = await fetchGames();
+    setGames(data);
+    setGamesCache(userId, data);
+    setGamesRefreshing(false);
+  };
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      const wasInactive =
+        appStateRef.current === 'inactive' || appStateRef.current === 'background';
+      if (wasInactive && nextState === 'active') {
+        void refreshGames();
+      }
+      appStateRef.current = nextState;
+    });
+
+    return () => {
+      subscription.remove();
     };
   }, [userId]);
 
@@ -793,6 +885,47 @@ export default function HomeScreen() {
   const pastMatches = gamesWithDateTime
     .filter((game) => game.dateTime < now)
     .sort((a, b) => b.dateTime - a.dateTime);
+  const showGamesSkeleton = gamesLoading && games.length === 0;
+  const skeletonSectionData = useMemo(
+    () => ({
+      upcoming: Array.from({ length: 3 }, (_value, index) => ({
+        id: `upcoming-skeleton-${index}`,
+      })),
+      past: Array.from({ length: 3 }, (_value, index) => ({ id: `past-skeleton-${index}` })),
+    }),
+    [],
+  );
+  const gameSections = useMemo(() => {
+    if (showGamesSkeleton) {
+      return [
+        {
+          title: 'Upcoming matches',
+          emptyText: 'No upcoming matches',
+          isSkeleton: true,
+          data: skeletonSectionData.upcoming,
+        },
+        {
+          title: 'Past matches',
+          emptyText: 'No past matches',
+          isSkeleton: true,
+          data: skeletonSectionData.past,
+        },
+      ];
+    }
+
+    return [
+      {
+        title: 'Upcoming matches',
+        emptyText: 'No upcoming matches',
+        data: upcomingMatches,
+      },
+      {
+        title: 'Past matches',
+        emptyText: 'No past matches',
+        data: pastMatches,
+      },
+    ];
+  }, [pastMatches, showGamesSkeleton, skeletonSectionData, upcomingMatches]);
 
   const leagueIconByName = useMemo(() => {
     const entries = leagueOptions
@@ -916,6 +1049,7 @@ export default function HomeScreen() {
 
     const updatedGames = await fetchGames();
     setGames(updatedGames);
+    setGamesCache(userId, updatedGames);
     resetCreateMatchForm();
     setIsCreateMatchOpen(false);
     showToast();
@@ -933,6 +1067,47 @@ export default function HomeScreen() {
     AR2: 'AR2',
     FOURTH: '4O',
   };
+  const handleMatchPress = (gameId) => {
+    if (isMatchOverlayVisible) {
+      return;
+    }
+    void impactAsync(ImpactFeedbackStyle.Soft);
+    setOverlayMatchId(gameId);
+    setIsMatchOverlayVisible(true);
+    matchOverlayTranslateX.setValue(screenWidth);
+    Animated.timing(matchOverlayTranslateX, {
+      toValue: 0,
+      duration: 240,
+      useNativeDriver: true,
+    }).start(({ finished }) => {
+      if (!finished) {
+        setIsMatchOverlayVisible(false);
+        return;
+      }
+      router.push({
+        pathname: '/match-details',
+        params: { gameId },
+      });
+      requestAnimationFrame(() => {
+        setIsMatchOverlayVisible(false);
+      });
+    });
+  };
+
+  const handleOverlayBack = () => {
+    if (!isMatchOverlayVisible) {
+      return;
+    }
+    matchOverlayTranslateX.stopAnimation();
+    Animated.timing(matchOverlayTranslateX, {
+      toValue: screenWidth,
+      duration: 200,
+      useNativeDriver: true,
+    }).start(() => {
+      setIsMatchOverlayVisible(false);
+      setOverlayMatchId(null);
+    });
+  };
 
   return (
     <View style={styles.screen}>
@@ -943,67 +1118,75 @@ export default function HomeScreen() {
           setIsCreateMatchOpen(true);
         }}
       />
-      <ScrollView style={styles.content} contentContainerStyle={styles.contentContainer}>
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Upcoming matches</Text>
-          {upcomingMatches.length === 0 ? (
-            <Text style={styles.emptyText}>No upcoming matches</Text>
-          ) : (
-            upcomingMatches.map((game) => (
-              <GameCard
-                key={game.id}
-                leagueName={game.competition ?? ''}
-                leagueIcon={leagueIconByName.get(game.competition ?? '')}
-                dateTime={game.dateTime}
-                homeTeam={game.home_team}
-                awayTeam={game.away_team}
-              />
-            ))
+        <SectionList
+          style={styles.content}
+          contentContainerStyle={styles.contentContainer}
+          sections={gameSections}
+          keyExtractor={(item) => String(item.id)}
+          refreshing={gamesRefreshing}
+          onRefresh={refreshGames}
+          renderSectionHeader={({ section }) => (
+            <Text style={styles.sectionTitle}>{section.title}</Text>
           )}
-        </View>
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Past matches</Text>
-          {pastMatches.length === 0 ? (
-            <Text style={styles.emptyText}>No past matches</Text>
-          ) : (
-            pastMatches.map((game) => (
-              <GameCard
-                key={game.id}
-                leagueName={game.competition ?? ''}
-                leagueIcon={leagueIconByName.get(game.competition ?? '')}
-                dateTime={game.dateTime}
-                homeTeam={game.home_team}
-                awayTeam={game.away_team}
-              />
-            ))
-          )}
-        </View>
-      </ScrollView>
-      <BottomTabBar />
-      {toastVisible ? (
-        <Animated.View
-          style={[
-            styles.toastWrapper,
-            {
-              opacity: toastAnim,
-              transform: [
-                {
-                  translateY: toastAnim.interpolate({
-                    inputRange: [0, 1],
-                    outputRange: [spacing[24], 0],
-                  }),
-                },
-              ],
-            },
-          ]}
-          pointerEvents="box-none"
-        >
-          <Pressable style={styles.toast} onPress={hideToast}>
-            <Text style={styles.toastText}>Match created succesfully</Text>
-            <Ionicons name="close-sharp" size={16} color={colors.ivory} />
-          </Pressable>
-        </Animated.View>
-      ) : null}
+          renderSectionFooter={({ section }) => {
+            if (section.isSkeleton) {
+              return <View style={styles.sectionFooterSpacer} />;
+            }
+            if (!section.data || section.data.length === 0) {
+              return (
+                <>
+                  <Text style={styles.emptyText}>{section.emptyText}</Text>
+                  <View style={styles.sectionFooterSpacer} />
+                </>
+              );
+            }
+            return <View style={styles.sectionFooterSpacer} />;
+          }}
+          renderItem={({ item, section }) =>
+            section.isSkeleton ? (
+              <GameCardSkeleton />
+            ) : (
+              <Pressable onPress={() => handleMatchPress(item.id)}>
+                <GameCard
+                  leagueName={item.competition ?? ''}
+                  leagueIcon={leagueIconByName.get(item.competition ?? '')}
+                  dateTime={item.dateTime}
+                  homeTeam={item.home_team}
+                  awayTeam={item.away_team}
+                />
+              </Pressable>
+            )
+          }
+          stickySectionHeadersEnabled={false}
+          initialNumToRender={6}
+          maxToRenderPerBatch={8}
+          windowSize={7}
+        />
+        <BottomTabBar />
+        {toastVisible ? (
+          <Animated.View
+            style={[
+              styles.toastWrapper,
+              {
+                opacity: toastAnim,
+                transform: [
+                  {
+                    translateY: toastAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [spacing[24], 0],
+                    }),
+                  },
+                ],
+              },
+            ]}
+            pointerEvents="box-none"
+          >
+            <Pressable style={styles.toast} onPress={hideToast}>
+              <Text style={styles.toastText}>Match created succesfully</Text>
+              <Ionicons name="close-sharp" size={16} color={colors.ivory} />
+            </Pressable>
+          </Animated.View>
+        ) : null}
       <Modal
         visible={isCreateMatchOpen}
         animationType="slide"
@@ -1712,6 +1895,19 @@ export default function HomeScreen() {
           ) : null}
         </View>
       </Modal>
+      {isMatchOverlayVisible ? (
+        <Animated.View
+          style={[
+            styles.matchOverlay,
+            { transform: [{ translateX: matchOverlayTranslateX }] },
+          ]}
+        >
+          <MatchDetailsPlaceholder
+            gameId={overlayMatchId}
+            onBack={handleOverlayBack}
+          />
+        </Animated.View>
+      ) : null}
     </View>
   );
 }
@@ -1721,6 +1917,15 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.ivory,
   },
+  matchOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: colors.ivory,
+    zIndex: 10,
+  },
   content: {
     flex: 1,
   },
@@ -1729,13 +1934,13 @@ const styles = StyleSheet.create({
     paddingTop: spacing[24],
     paddingBottom: spacing[64] + spacing[32] + spacing[24],
   },
-  section: {
-    marginBottom: spacing[24],
-  },
   sectionTitle: {
     ...typography.title.medium,
     color: colors.black,
     marginBottom: spacing[12],
+  },
+  sectionFooterSpacer: {
+    height: spacing[24],
   },
   emptyText: {
     ...typography.paragraph.medium,
