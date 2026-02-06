@@ -1,546 +1,292 @@
-Supabase database structure goes here.
-# Touchline — Database Schema + RLS Reference (MVP)
+# RefCoach Database Schema (Field Reference)
 
-Last updated: 2026-01-30
-
-This document is the source of truth for:
-- Table schema (MVP)
-- Key relationships
-- RLS access model and policy expressions (Supabase Dashboard)
-- Storage bucket path conventions (audio + PDFs)
+This document is a **direct structural reference** of the database schema.
+It lists **all tables**, their **fields**, and **Postgres data types** as defined in the SQL.
+No interpretation or business logic is applied here.
 
 ---
 
-## Access Model (Core Principle)
-
-Access is **match-scoped** via `game_members`.
-
-- If a user is a **member** of a match (`game_members`), they can **read** match data.
-- If a user is an **editor** of a match (`game_members.access_level = 'editor'`), they can **write** match data.
-- Report editing is restricted to the **report author** (plus match editor membership).
-
-Roles exist (`user_profiles.role`) but MVP relies primarily on **match membership**. Roles are used for org-level config writes (incident definitions, templates).
-
----
-
-## Tables (MVP)
-
-### orgs
-**Purpose:** federation/organisation container (single-org per user in MVP)
-
-Columns:
-- id (uuid, PK)
-- name (text)
-- created_at (timestamptz)
+## game_clock
+| Field | Type |
+|------|------|
+| game_id | uuid |
+| period | text |
+| period_started_at_utc | timestamptz |
+| paused_total_seconds | bigint |
+| paused_at_utc | timestamptz |
+| updated_at | timestamptz |
 
 ---
 
-### user_profiles
-**Purpose:** app users; maps 1:1 to Supabase auth users
-
-Columns:
-- id (uuid, PK; FK auth.users.id)
-- org_id (uuid, FK orgs.id)
-- full_name (text)
-- role (text: coach | manager | admin | official)
-- created_at (timestamptz)
-
-Notes:
-- MVP: one org per user (scalable later via memberships)
+## game_members
+| Field | Type |
+|------|------|
+| id | uuid |
+| game_id | uuid |
+| profile_id | uuid |
+| access_level | text |
+| created_at | timestamptz |
 
 ---
 
-### officials
-**Purpose:** officiating people (not necessarily app users)
-
-Columns:
-- id (uuid, PK)
-- org_id (uuid, FK orgs.id)
-- full_name (text)
-- active (bool)
-- created_at (timestamptz)
-- panel_id (UUID, FK panels.id)
+## game_officials
+| Field | Type |
+|------|------|
+| id | uuid |
+| game_id | uuid |
+| official_id | uuid |
+| role | text |
+| created_at | timestamptz |
 
 ---
 
-### games
-**Purpose:** match entity created by a coach
-
-Columns:
-- id (uuid, PK)
-- org_id (uuid, FK orgs.id)
-- created_by (uuid, FK user_profiles.id)
-- game_date (date)
-- kickoff_time (time, nullable)
-- competition (text)
-- ground (text)
-- home_team (text)
-- away_team (text)
-- status (text: draft | in_progress | complete)
-- created_at (timestamptz)
-- half_length_minutes (int8)
-- has_extra_time (bool)
-- extra_time_length_minutes (int8)
-
----
-
-### game_members  ✅ Access Gate
-**Purpose:** controls who can view/edit a match
-
-Columns:
-- id (uuid, PK)
-- game_id (uuid, FK games.id)
-- profile_id (uuid, FK user_profiles.id)
-- access_level (text: viewer | editor)
-- created_at (timestamptz)
-
-Constraints:
-- Unique (game_id, profile_id)
+## games
+| Field | Type |
+|------|------|
+| id | uuid |
+| org_id | uuid |
+| created_by | uuid |
+| game_date | date |
+| kickoff_time | time |
+| competition | text |
+| ground | text |
+| home_team | text |
+| away_team | text |
+| status | text |
+| created_at | timestamptz |
+| half_length_minutes | bigint |
+| has_extra_time | boolean |
+| extra_time_length_minutes | bigint |
 
 ---
 
-### leagues
-**Purpose:** have leagues per organisation
-
-Columns:
-- id (uuid, PK)
-- org_id (uuid, FK orgs.id)
-- name (text)
-- created_at (timestamptz)
-
----
-
-### game_officials
-**Purpose:** assigns officials to a game with roles (REF/AR1/AR2/FOURTH)
-
-Columns:
-- id (uuid, PK)
-- game_id (uuid, FK games.id)
-- official_id (uuid, FK officials.id)
-- role (text: REF | AR1 | AR2 | FOURTH)
-- created_at
-
-Constraints:
-- Unique (game_id, role)
-- Optional: Unique (game_id, official_id)
+## incident_audio
+| Field | Type |
+|------|------|
+| id | uuid |
+| incident_id | uuid |
+| storage_path | text |
+| duration_seconds | bigint |
+| created_at | timestamptz |
 
 ---
 
-### game_clock
-**Purpose:** in-game timer state (1H/2H)
-
-Columns:
-- game_id (uuid, PK; FK games.id)
-- period (text: 1H | 2H)
-- period_started_at_utc (timestamptz, nullable)
-- paused_total_seconds (int)
-- paused_at_utc (timestamptz, nullable)
-- updated_at (timestamptz)
+## incident_option_selections
+| Field | Type |
+|------|------|
+| id | uuid |
+| incident_id | uuid |
+| option_id | uuid |
+| sequence | bigint |
+| created_at | timestamptz |
 
 ---
 
-### incident_types
-**Purpose:** configurable incident categories per org
-
-Columns:
-- id (uuid, PK)
-- org_id (uuid, FK orgs.id)
-- code (text, stable)
-- label (text)
-- sort_order (int)
-- active (bool)
-- created_at
-
-Constraints:
-- Unique (org_id, code)
+## incident_options
+| Field | Type |
+|------|------|
+| id | uuid |
+| incident_type_id | uuid |
+| label | text |
+| value_code | text |
+| sort_order | bigint |
+| active | boolean |
+| created_at | timestamptz |
+| parent_option_id | uuid |
 
 ---
 
-### incident_options (tree)
-**Purpose:** Type → Outcome → Reason hierarchy (nested options)
-
-Columns:
-- id (uuid, PK)
-- incident_type_id (uuid, FK incident_types.id)
-- parent_option_id (uuid, FK incident_options.id, nullable)
-- label (text)
-- value_code (text, nullable)
-- sort_order (int)
-- active (bool)
-- created_at
+## incident_targets
+| Field | Type |
+|------|------|
+| id | uuid |
+| incident_id | uuid |
+| game_official_id | uuid |
+| created_at | timestamptz |
 
 ---
 
-### incidents
-**Purpose:** recorded events during a match (editable anytime)
-
-Columns:
-- id (uuid, PK)
-- org_id (uuid, FK orgs.id)
-- game_id (uuid, FK games.id)
-- created_by (uuid, FK user_profiles.id)
-- period (text: 1H | 2H)
-- clock_second_in_period (int)
-- real_world_time_utc (timestamptz)
-- incident_type_id (uuid, FK incident_types.id)
-- leaf_option_id (uuid, FK incident_options.id, nullable)
-- note_text (text, nullable)
-- deleted_at (timestamptz, nullable)  <-- soft delete
-- created_at (timestamptz)
+## incident_types
+| Field | Type |
+|------|------|
+| id | uuid |
+| code | text |
+| label | text |
+| sort_order | bigint |
+| active | boolean |
+| created_at | timestamptz |
+| sport_id | uuid |
 
 ---
 
-### incident_targets  ✅ Shared + Match-level incidents
-**Purpose:** links a single incident to 0..N officials
-
-Columns:
-- id (uuid, PK)
-- incident_id (uuid, FK incidents.id)
-- game_official_id (uuid, FK game_officials.id, nullable)
-- created_at
-
-Meaning:
-- Match-level incident: one row where game_official_id is NULL
-- Single-official incident: one row with that game_official_id
-- Shared incident: multiple rows, one per official
-
-Constraints:
-- Unique (incident_id, game_official_id)
-Note: NULL uniqueness isn't enforced by Postgres; enforce "one NULL target max" in app for MVP.
-
----
-
-### incident_audio
-**Purpose:** audio attachments per incident (optional, multiple per incident allowed)
-
-Columns:
-- id (uuid, PK)
-- incident_id (uuid, FK incidents.id)
-- storage_path (text)
-- duration_seconds (int, nullable)
-- created_at
+## incidents
+| Field | Type |
+|------|------|
+| id | uuid |
+| org_id | uuid |
+| game_id | uuid |
+| created_by | uuid |
+| period | text |
+| clock_second_in_period | bigint |
+| real_world_time_utc | timestamptz |
+| note_text | text |
+| deleted_at | timestamptz |
+| created_at | timestamptz |
+| kmi_tariff | text |
+| tree_version | bigint |
+| path_codes | text[] |
+| incident_json | jsonb |
+| incident_type_code | text |
+| restart_code | text |
+| offence_code | text |
+| sanction_code | text |
+| reason_code | text |
+| assessment_code | text |
 
 ---
 
-### reports  ✅ Multi-author + re-submit
-**Purpose:** per (game + official + author) report record
-
-Columns:
-- id (uuid, PK)
-- org_id (uuid, FK orgs.id)
-- game_id (uuid, FK games.id)
-- game_official_id (uuid, FK game_officials.id, nullable)  <-- allows match-wide later
-- author_id (uuid, FK user_profiles.id)
-- status (text: draft | submitted)
-- version (int, default 1)
-- submitted_at (timestamptz, nullable)
-- created_at
-
-Constraints:
-- Unique (game_id, game_official_id, author_id)
+## league_panels
+| Field | Type |
+|------|------|
+| league_id | uuid |
+| panel_id | uuid |
+| created_at | timestamptz |
 
 ---
 
-### report_ai_drafts
-**Purpose:** stores AI generated preliminary summary (regenerate only on explicit action)
-
-Columns:
-- id (uuid, PK)
-- report_id (uuid, FK reports.id)
-- generated_text (text)
-- generated_at (timestamptz)
-- model_name (text, nullable)
-- input_hash (text, nullable)
+## leagues
+| Field | Type |
+|------|------|
+| id | uuid |
+| org_id | uuid |
+| name | text |
+| created_at | timestamptz |
+| icon | text |
 
 ---
 
-### report_templates
-**Purpose:** configurable report structure per org
-
-Columns:
-- id (uuid, PK)
-- org_id (uuid, FK orgs.id)
-- name (text)
-- is_default (bool)
-- created_at
-
----
-
-### report_sections
-**Purpose:** ordered sections within a template
-
-Columns:
-- id (uuid, PK)
-- template_id (uuid, FK report_templates.id)
-- key (text, stable)
-- label (text)
-- sort_order (int)
-- created_at
-
-Constraints:
-- Unique (template_id, key)
+## officials
+| Field | Type |
+|------|------|
+| id | uuid |
+| org_id | uuid |
+| full_name | text |
+| active | boolean |
+| created_at | timestamptz |
+| panel_id | uuid |
 
 ---
 
-### report_section_entries
-**Purpose:** editable content for each section per report
-
-Columns:
-- id (uuid, PK)
-- report_id (uuid, FK reports.id)
-- section_id (uuid, FK report_sections.id)
-- content (text)
-- created_at
-
-Constraints:
-- Unique (report_id, section_id)
+## orgs
+| Field | Type |
+|------|------|
+| id | uuid |
+| name | text |
+| created_at | timestamptz |
 
 ---
 
-### panels
-**Purpose:** define org panels to sort officials
-
-Columns:
-- id (uuid, PK)
-- org_id (uuid, FK orgs.id)
-- name (text)
-- description (text)
-- sort_order (int)
-- created_at
-
+## panels
+| Field | Type |
+|------|------|
+| id | uuid |
+| org_id | uuid |
+| name | text |
+| description | text |
+| sort_order | bigint |
+| created_at | timestamptz |
 
 ---
 
-### league_panels 
-**Purpose:** join table to assign officials to panels
-
-Columns:
-- league_id (uuid PK, FK to leagues.id)
-- panel_id (uuid PK, FK to panels.id
-- created_at
-
-
----
-
-## App-side Required Writes (to satisfy RLS)
-
-When creating a game:
-1) Insert `games`
-2) Insert `game_members` (creator as editor)
-3) Insert `game_clock`
-4) Insert `game_officials`
-5) Insert `reports` for current user (one per game_official_id)
-
-When recording an incident:
-1) Insert `incidents`
-2) Insert `incident_targets` for:
-   - match-level OR one official OR multiple officials
-
-Preliminary report save:
-- Create/update `report_ai_drafts` only when "Regenerate" is tapped (or first run)
-
-Submit / Re-submit:
-- Update `reports.status='submitted'`
-- Update `submitted_at=now()`
-- Increment `version` on re-submit
+## report_ai_drafts
+| Field | Type |
+|------|------|
+| id | uuid |
+| report_id | uuid |
+| generated_text | text |
+| generated_at | timestamptz |
+| model_name | text |
+| input_hash | text |
 
 ---
 
-## RLS Policy Expressions (Supabase Dashboard Reference)
-
-### user_profiles
-SELECT: `id = auth.uid()`
-UPDATE USING + WITH CHECK: `id = auth.uid()`
-
-### orgs
-SELECT: `id = (select org_id from user_profiles where id = auth.uid())`
-
-### officials
-SELECT:
-`org_id = (select org_id from user_profiles where id = auth.uid())`
-
-WRITE (manager/admin):
-`org_id = (select org_id from user_profiles where id = auth.uid())
-and (select role from user_profiles where id = auth.uid()) in ('manager','admin')`
-
-### games
-SELECT (must be member):
-`exists (select 1 from game_members gm where gm.game_id = games.id and gm.profile_id = auth.uid())`
-
-INSERT:
-`created_by = auth.uid()
-and org_id = (select org_id from user_profiles where id = auth.uid())`
-
-UPDATE/DELETE (editors):
-`exists (select 1 from game_members gm where gm.game_id = games.id and gm.profile_id = auth.uid() and gm.access_level = 'editor')`
-
-### game_members
-SELECT (member can see):
-`exists (select 1 from game_members gm where gm.game_id = game_members.game_id and gm.profile_id = auth.uid())`
-
-INSERT/UPDATE/DELETE (editors of that game):
-`exists (select 1 from game_members gm where gm.game_id = game_members.game_id and gm.profile_id = auth.uid() and gm.access_level = 'editor')`
-
-### game_officials
-SELECT:
-`exists (select 1 from game_members gm where gm.game_id = game_officials.game_id and gm.profile_id = auth.uid())`
-WRITE (editors):
-`exists (select 1 from game_members gm where gm.game_id = game_officials.game_id and gm.profile_id = auth.uid() and gm.access_level = 'editor')`
-
-### game_clock
-SELECT:
-`exists (select 1 from game_members gm where gm.game_id = game_clock.game_id and gm.profile_id = auth.uid())`
-UPDATE (editors):
-`exists (select 1 from game_members gm where gm.game_id = game_clock.game_id and gm.profile_id = auth.uid() and gm.access_level = 'editor')`
-
-### incident_types
-SELECT:
-`org_id = (select org_id from user_profiles where id = auth.uid())`
-WRITE (manager/admin):
-`org_id = (select org_id from user_profiles where id = auth.uid())
-and (select role from user_profiles where id = auth.uid()) in ('manager','admin')`
-
-### incident_options
-SELECT:
-`exists (select 1 from incident_types it
-  where it.id = incident_options.incident_type_id
-  and it.org_id = (select org_id from user_profiles where id = auth.uid()))`
-
-WRITE (manager/admin):
-`(select role from user_profiles where id = auth.uid()) in ('manager','admin')
-and exists (select 1 from incident_types it
-  where it.id = incident_options.incident_type_id
-  and it.org_id = (select org_id from user_profiles where id = auth.uid()))`
-
-### incidents
-SELECT:
-`exists (select 1 from game_members gm where gm.game_id = incidents.game_id and gm.profile_id = auth.uid())
-and deleted_at is null`
-
-INSERT:
-`exists (select 1 from game_members gm where gm.game_id = incidents.game_id and gm.profile_id = auth.uid() and gm.access_level = 'editor')
-and created_by = auth.uid()
-and org_id = (select org_id from games where id = incidents.game_id)`
-
-UPDATE:
-`exists (select 1 from game_members gm where gm.game_id = incidents.game_id and gm.profile_id = auth.uid() and gm.access_level = 'editor')`
-
-DELETE: not used (soft delete via deleted_at)
-
-### incident_targets
-SELECT:
-`exists (
-  select 1 from incidents i
-  join game_members gm on gm.game_id = i.game_id
-  where i.id = incident_targets.incident_id
-  and gm.profile_id = auth.uid()
-  and i.deleted_at is null
-)`
-
-WRITE:
-`exists (
-  select 1 from incidents i
-  join game_members gm on gm.game_id = i.game_id
-  where i.id = incident_targets.incident_id
-  and gm.profile_id = auth.uid()
-  and gm.access_level = 'editor'
-)`
-
-### incident_audio
-SELECT:
-`exists (
-  select 1 from incidents i
-  join game_members gm on gm.game_id = i.game_id
-  where i.id = incident_audio.incident_id
-  and gm.profile_id = auth.uid()
-  and i.deleted_at is null
-)`
-
-WRITE:
-`exists (
-  select 1 from incidents i
-  join game_members gm on gm.game_id = i.game_id
-  where i.id = incident_audio.incident_id
-  and gm.profile_id = auth.uid()
-  and gm.access_level = 'editor'
-)`
-
-### reports
-SELECT:
-`exists (select 1 from game_members gm where gm.game_id = reports.game_id and gm.profile_id = auth.uid())`
-
-INSERT:
-`exists (select 1 from game_members gm where gm.game_id = reports.game_id and gm.profile_id = auth.uid() and gm.access_level = 'editor')
-and author_id = auth.uid()
-and org_id = (select org_id from games where id = reports.game_id)`
-
-UPDATE (author only):
-`author_id = auth.uid()
-and exists (select 1 from game_members gm where gm.game_id = reports.game_id and gm.profile_id = auth.uid() and gm.access_level = 'editor')`
-
-### report_ai_drafts
-SELECT:
-`exists (
-  select 1 from reports r
-  join game_members gm on gm.game_id = r.game_id
-  where r.id = report_ai_drafts.report_id
-  and gm.profile_id = auth.uid()
-)`
-
-WRITE (author only):
-`exists (
-  select 1 from reports r
-  join game_members gm on gm.game_id = r.game_id
-  where r.id = report_ai_drafts.report_id
-  and r.author_id = auth.uid()
-  and gm.profile_id = auth.uid()
-  and gm.access_level = 'editor'
-)`
-
-### report_templates / report_sections
-Same pattern as incident definitions:
-- SELECT scoped to org
-- WRITE manager/admin
-
-### report_section_entries
-SELECT:
-`exists (
-  select 1 from reports r
-  join game_members gm on gm.game_id = r.game_id
-  where r.id = report_section_entries.report_id
-  and gm.profile_id = auth.uid()
-)`
-
-UPDATE (author only):
-`exists (
-  select 1 from reports r
-  join game_members gm on gm.game_id = r.game_id
-  where r.id = report_section_entries.report_id
-  and r.author_id = auth.uid()
-  and gm.profile_id = auth.uid()
-  and gm.access_level = 'editor'
-)`
+## report_section_entries
+| Field | Type |
+|------|------|
+| id | uuid |
+| report_id | uuid |
+| section_id | uuid |
+| content | text |
+| created_at | timestamptz |
 
 ---
 
-## Storage Path Conventions (MVP)
-
-### incident-audio bucket (private)
-Store objects under:
-- `{incident_id}/{filename}`
-
-Example:
-- `3f2a...-uuid/1700_abc123.m4a`
-
-This makes RLS simple because the first path segment maps to `incidents.id`.
-
-### report-pdfs bucket (private)
-Store objects under:
-- `{game_id}/{report_id}/v{version}.pdf`
-
-Example:
-- `9aa1...-uuid/7bb2...-uuid/v3.pdf`
-
-This makes RLS simple because the first path segment maps to `games.id`.
+## report_sections
+| Field | Type |
+|------|------|
+| id | uuid |
+| template_id | uuid |
+| key | text |
+| label | text |
+| sort_order | bigint |
+| created_at | timestamptz |
 
 ---
+
+## report_templates
+| Field | Type |
+|------|------|
+| id | uuid |
+| org_id | uuid |
+| name | text |
+| is_default | boolean |
+| created_at | timestamptz |
+
+---
+
+## reports
+| Field | Type |
+|------|------|
+| id | uuid |
+| org_id | uuid |
+| game_id | uuid |
+| game_official_id | uuid |
+| author_id | uuid |
+| status | text |
+| version | bigint |
+| submitted_at | timestamptz |
+| created_at | timestamptz |
+
+---
+
+## sport_trees
+| Field | Type |
+|------|------|
+| id | uuid |
+| sport_id | uuid |
+| version | bigint |
+| status | text |
+| tree_json | jsonb |
+| created_at | timestamptz |
+| published_at | timestamptz |
+
+---
+
+## sports
+| Field | Type |
+|------|------|
+| id | uuid |
+| code | text |
+| name | text |
+| created_at | timestamptz |
+
+---
+
+## user_profiles
+| Field | Type |
+|------|------|
+| id | uuid |
+| org_id | uuid |
+| full_name | text |
+| role | text |
+| created_at | timestamptz |

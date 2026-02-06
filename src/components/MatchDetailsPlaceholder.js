@@ -1,5 +1,6 @@
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useEffect, useMemo, useState } from 'react';
+import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { MatchHeaderContainer } from './headers';
 import GameCard from './GameCard';
@@ -78,16 +79,20 @@ const officialRoleDisplay = {
 };
 
 export default function MatchDetailsPlaceholder({ gameId, onBack }) {
+  const router = useRouter();
   const [match, setMatch] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
   const [now, setNow] = useState(() => new Date());
 
   useEffect(() => {
     let isActive = true;
 
     const loadMatch = async () => {
+      setIsLoading(true);
       if (!gameId) {
         if (isActive) {
           setMatch(null);
+          setIsLoading(false);
         }
         return;
       }
@@ -118,9 +123,11 @@ export default function MatchDetailsPlaceholder({ gameId, onBack }) {
       if (error) {
         console.warn('Failed to load match details:', error.message);
         setMatch(null);
+        setIsLoading(false);
         return;
       }
       setMatch(data ?? null);
+      setIsLoading(false);
     };
 
     void loadMatch();
@@ -145,9 +152,12 @@ export default function MatchDetailsPlaceholder({ gameId, onBack }) {
     const diffMs = kickoffTime.getTime() - now.getTime();
     return Math.floor(diffMs / 60000);
   }, [kickoffTime, now]);
-  const countdownColor = useMemo(() => getCountdownColor(diffMinutes), [diffMinutes]);
+  const countdownColor = useMemo(
+    () => (kickoffTime ? getCountdownColor(diffMinutes) : colors.softGrey),
+    [diffMinutes, kickoffTime],
+  );
   const title = kickoffTime && kickoffTime > now ? 'Upcoming match' : 'Match details';
-  const countdownText = formatCountdown(diffMinutes);
+  const countdownText = kickoffTime ? formatCountdown(diffMinutes) : '—';
 
   const matchDateTime = kickoffTime;
   const officialsByRole = useMemo(() => {
@@ -187,13 +197,24 @@ export default function MatchDetailsPlaceholder({ gameId, onBack }) {
                 <Ionicons name="chevron-back" size={20} color={colors.ivory} />
               </Pressable>
             ) : null}
-            <Text style={styles.headerTitle}>{title}</Text>
+            {isLoading ? <View style={styles.headerTitleSkeleton} /> : (
+              <Text style={styles.headerTitle}>{title}</Text>
+            )}
           </View>
           <View style={styles.countdown}>
-            <Text style={styles.countdownLabel}>Kick off in</Text>
-            <Text style={[styles.countdownValue, { color: countdownColor }]}>
-              {countdownText}
-            </Text>
+            {isLoading ? (
+              <>
+                <View style={styles.countdownLabelSkeleton} />
+                <View style={styles.countdownValueSkeleton} />
+              </>
+            ) : (
+              <>
+                <Text style={styles.countdownLabel}>Kick off in</Text>
+                <Text style={[styles.countdownValue, { color: countdownColor }]}>
+                  {countdownText}
+                </Text>
+              </>
+            )}
           </View>
         </View>
       </MatchHeaderContainer>
@@ -235,7 +256,12 @@ export default function MatchDetailsPlaceholder({ gameId, onBack }) {
         </View>
       </ScrollView>
       <View style={styles.ctaContainer}>
-        <PrimaryButton title="Get ready" onPress={() => {}} />
+        <PrimaryButton
+          title="Get ready"
+          onPress={() => {
+            router.push({ pathname: '/live-recording', params: { gameId } });
+          }}
+        />
       </View>
     </View>
   );
@@ -277,6 +303,12 @@ const styles = StyleSheet.create({
     ...typography.title.large,
     flexShrink: 1,
   },
+  headerTitleSkeleton: {
+    height: 24,
+    width: 160,
+    borderRadius: 12,
+    backgroundColor: colors.softGrey,
+  },
   countdown: {
     alignItems: 'flex-end',
     marginLeft: spacing[12],
@@ -289,6 +321,19 @@ const styles = StyleSheet.create({
   countdownValue: {
     ...typography.label.medium,
     textAlign: 'right',
+  },
+  countdownLabelSkeleton: {
+    height: 12,
+    width: 72,
+    borderRadius: 6,
+    backgroundColor: colors.softGrey,
+    marginBottom: spacing[4],
+  },
+  countdownValueSkeleton: {
+    height: 16,
+    width: 84,
+    borderRadius: 8,
+    backgroundColor: colors.softGrey,
   },
   infoCard: {
     backgroundColor: colors.warmGrey,
