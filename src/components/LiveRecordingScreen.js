@@ -9,11 +9,14 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { MatchHeaderContainer } from './headers';
 import PrimaryButton from './PrimaryButton';
+import RunsheetView from './RunsheetView';
 import { colors, spacing, typography } from '../theme';
 import { supabase } from '../lib/supabase';
+import { enqueueIncident, getIncidentQueue, removeIncidentByLocalIds } from '../lib/incidentQueue';
 import { impactAsync, ImpactFeedbackStyle } from '../lib/haptics';
 
 const FORMAT_CLOCK = (totalSeconds) => {
@@ -25,6 +28,9 @@ const FORMAT_CLOCK = (totalSeconds) => {
   const seconds = clamped % 60;
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 };
+
+const createLocalIncidentId = () =>
+  `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 const getStepOptions = (definition, selections, dictionaries) => {
   if (!definition) {
@@ -74,62 +80,178 @@ const getOptionTextColor = (option, isSelected) => {
   return isSelected ? colors.ivory : colors.black;
 };
 
+import { getIconNamesFromPathCodes } from './CustomIcons';
+import {
+  buildDefaultPeriodSequence,
+  buildPeriodSequenceFromRules,
+} from '../lib/periodSequence';
 
 export default function LiveRecordingScreen({ gameId }) {
+  const router = useRouter();
   const [match, setMatch] = useState(null);
   const [isLoadingMatch, setIsLoadingMatch] = useState(true);
   const [tree, setTree] = useState(null);
+  const [treeVersion, setTreeVersion] = useState(null);
   const [isLoadingTree, setIsLoadingTree] = useState(true);
   const [incidents, setIncidents] = useState([]);
   const [isLoadingIncidents, setIsLoadingIncidents] = useState(true);
   const [activeTab, setActiveTab] = useState('record');
-  const [isLive, setIsLive] = useState(false);
+  const [recordingStatus, setRecordingStatus] = useState('idle');
+  const [periodIndex, setPeriodIndex] = useState(0);
+  const [sportRules, setSportRules] = useState(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [timerRunning, setTimerRunning] = useState(false);
-  const [currentPeriod, setCurrentPeriod] = useState('1H');
   const [selectedIncidentType, setSelectedIncidentType] = useState(null);
   const [stepIndex, setStepIndex] = useState(0);
+  const [viewStepIndex, setViewStepIndex] = useState(null);
   const [stepSelections, setStepSelections] = useState({});
   const [noteText, setNoteText] = useState('');
-  const [lastDraft, setLastDraft] = useState(null);
+  const [decisionStartSeconds, setDecisionStartSeconds] = useState(null);
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [isSavingIncidents, setIsSavingIncidents] = useState(false);
+  const [justRecordedAt, setJustRecordedAt] = useState(null);
   const incidentsChannelRef = useRef(null);
+  const incidentSaveInFlightRef = useRef(false);
+  const incidentFinalizeInFlightRef = useRef(false);
 
-  const halfLengthSeconds = useMemo(() => {
-    const minutes = match?.half_length_minutes;
+  const isLive = recordingStatus !== 'idle';
+
+  const periodSequence = useMemo(() => {
+    const fromRules = buildPeriodSequenceFromRules(sportRules, match?.has_extra_time, match);
+    if (fromRules?.length) {
+      return fromRules;
+    }
+    return buildDefaultPeriodSequence(match);
+  }, [sportRules, match]);
+
+  const currentPeriodMeta = useMemo(
+    () => periodSequence[periodIndex] ?? periodSequence[0] ?? null,
+    [periodSequence, periodIndex],
+  );
+
+  const currentPeriodCode = currentPeriodMeta?.code ?? '1H';
+  const currentPeriodLabel = useMemo(() => {
+    if (currentPeriodMeta?.label) {
+      return currentPeriodMeta.label;
+    }
+    switch (currentPeriodCode) {
+      case '1H':
+        return '1st Half';
+      case '2H':
+        return '2nd Half';
+      case '1ET':
+        return 'ET 1st Half';
+      case '2ET':
+        return 'ET 2nd Half';
+      case 'PK':
+        return 'Penalties';
+      default:
+        return currentPeriodCode;
+    }
+  }, [currentPeriodCode, currentPeriodMeta]);
+
+  const nextPeriod = useMemo(
+    () => periodSequence[periodIndex + 1] ?? null,
+    [periodSequence, periodIndex],
+  );
+
+  const currentPeriodClockRunning = currentPeriodMeta?.isClockRunning ?? true;
+  const nextPeriodClockRunning = nextPeriod?.isClockRunning ?? true;
+
+  const currentPeriodLengthSeconds = useMemo(() => {
+    const minutes = currentPeriodMeta?.lengthMinutes ?? match?.half_length_minutes;
     if (!Number.isFinite(minutes)) {
       return 0;
     }
     return Math.max(0, Math.floor(minutes) * 60);
-  }, [match]);
+  }, [currentPeriodMeta, match]);
 
-  const periodLabel = useMemo(() => {
-    switch (currentPeriod) {
-      case '1H':
-        return '1st';
-      case '2H':
-        return '2nd';
-      case '1ET':
-        return '1ET';
-      case '2ET':
-        return '2ET';
-      case 'PK':
-        return 'PK';
-      default:
-        return currentPeriod;
+  const nextPeriodLengthSeconds = useMemo(() => {
+    if (!nextPeriod) {
+      return 0;
     }
-  }, [currentPeriod]);
+    const minutes = nextPeriod.lengthMinutes ?? match?.half_length_minutes;
+    if (!Number.isFinite(minutes)) {
+      return 0;
+    }
+    return Math.max(0, Math.floor(minutes) * 60);
+  }, [nextPeriod, match]);
+
+  const hasEntryFlow = Boolean(tree?.entryFlow?.steps?.length);
+  const entryFlow = tree?.entryFlow ?? null;
 
   const incidentTypes = useMemo(() => tree?.incidentTypes ?? [], [tree]);
 
   const activeIncident = useMemo(() => {
+    if (hasEntryFlow) {
+      const typeCode = stepSelections.INCIDENT_TYPE ?? selectedIncidentType;
+      const incidentTypeConfig = typeCode
+        ? incidentTypes.find((t) => t.typeCode === typeCode)
+        : null;
+      const entrySteps = entryFlow.steps ?? [];
+      const typeSteps = incidentTypeConfig?.steps ?? [];
+      const typeDefs = incidentTypeConfig?.stepDefinitions ?? {};
+      const steps = [...entrySteps, ...typeSteps];
+      const stepDefinitions = {
+        ...(entryFlow.stepDefinitions ?? {}),
+        ...typeDefs,
+      };
+      return { steps, stepDefinitions, typeCode: typeCode ?? incidentTypeConfig?.typeCode };
+    }
     if (!selectedIncidentType) {
       return null;
     }
     return incidentTypes.find((type) => type.typeCode === selectedIncidentType) ?? null;
-  }, [incidentTypes, selectedIncidentType]);
+  }, [
+    entryFlow,
+    hasEntryFlow,
+    incidentTypes,
+    selectedIncidentType,
+    stepSelections.INCIDENT_TYPE,
+  ]);
 
   const activeSteps = activeIncident?.steps ?? [];
-  const currentStepKey = activeSteps[stepIndex];
+
+  const derivedStepIndex = useMemo(() => {
+    for (let i = 0; i < activeSteps.length; i++) {
+      const stepKey = activeSteps[i];
+      const def = activeIncident?.stepDefinitions?.[stepKey];
+      if (def?.input?.type === 'text') {
+        return i;
+      }
+      if (def?.input?.type === 'group') {
+        const fields = def.input.fields ?? [];
+        const complete = fields.every((f) => {
+          if (f.required === false) return true;
+          const v = stepSelections[`${stepKey}.${f.key}`];
+          return v != null && v !== '';
+        });
+        if (!complete) return i;
+      } else {
+        const val = stepSelections[stepKey];
+        const required = def?.required !== false;
+        if (required && (val == null || val === '')) return i;
+        // Optional steps with conditionalSources: show them when the condition is met
+        // (e.g. REASON when SANCTION is YC/RC) so the user can optionally pick
+        if (
+          def?.conditionalSources?.length &&
+          (val == null || val === '')
+        ) {
+          const conditionMet = def.conditionalSources.some((source) => {
+            if (!source.when) return false;
+            return Object.entries(source.when).every(
+              ([k, v]) => stepSelections[k] === v,
+            );
+          });
+          if (conditionMet) return i;
+        }
+      }
+    }
+    return activeSteps.length - 1;
+  }, [activeIncident?.stepDefinitions, activeSteps, stepSelections]);
+
+  const currentStepIndex = viewStepIndex ?? derivedStepIndex;
+  const currentStepKey = activeSteps[currentStepIndex];
   const currentStepDefinition = currentStepKey
     ? activeIncident?.stepDefinitions?.[currentStepKey]
     : null;
@@ -138,6 +260,62 @@ export default function LiveRecordingScreen({ gameId }) {
     const options = getStepOptions(currentStepDefinition, stepSelections, tree?.dictionaries);
     return filterOptionsByConditions(options, stepSelections);
   }, [currentStepDefinition, stepSelections, tree]);
+
+  const breadcrumbItems = useMemo(() => {
+    if (!selectedIncidentType && Object.keys(stepSelections).length === 0) {
+      return [];
+    }
+    const items = [FORMAT_CLOCK(decisionStartSeconds ?? elapsedSeconds)];
+    if (selectedIncidentType) {
+      const incidentLabel = incidentTypes.find(
+        (type) => type.typeCode === selectedIncidentType,
+      )?.label;
+      items.push(incidentLabel ?? selectedIncidentType);
+    }
+    activeSteps.forEach((stepKey) => {
+      const stepDefinition = activeIncident?.stepDefinitions?.[stepKey];
+      if (!stepDefinition) {
+        return;
+      }
+      if (stepDefinition.input?.type === 'group') {
+        const fields = stepDefinition.input.fields ?? [];
+        fields.forEach((field) => {
+          const fieldKey = `${stepKey}.${field.key}`;
+          const selection = stepSelections[fieldKey];
+          if (!selection) {
+            return;
+          }
+          const options = tree?.dictionaries?.[field.optionsSource] ?? [];
+          const label = options.find((option) => option.code === selection)?.label;
+          items.push(label ?? selection);
+        });
+        return;
+      }
+      const selection = stepSelections[stepKey];
+      if (!selection) {
+        return;
+      }
+      const options = getStepOptions(stepDefinition, stepSelections, tree?.dictionaries);
+      const label = options.find((option) => option.code === selection)?.label;
+      items.push(label ?? selection);
+    });
+    return items;
+  }, [
+    activeIncident?.stepDefinitions,
+    activeSteps,
+    decisionStartSeconds,
+    elapsedSeconds,
+    incidentTypes,
+    selectedIncidentType,
+    stepSelections,
+    tree?.dictionaries,
+  ]);
+
+  useEffect(() => {
+    if (hasEntryFlow && recordingStatus === 'live' && Object.keys(stepSelections).length === 0) {
+      setDecisionStartSeconds((prev) => prev ?? elapsedSeconds);
+    }
+  }, [elapsedSeconds, hasEntryFlow, recordingStatus, stepSelections]);
 
   useEffect(() => {
     if (!currentStepKey || !currentStepDefinition) {
@@ -161,7 +339,7 @@ export default function LiveRecordingScreen({ gameId }) {
       !currentStepDefinition.input &&
       (!stepOptions || stepOptions.length === 0) &&
       currentStepDefinition.required === false &&
-      stepIndex < activeSteps.length - 1
+      currentStepIndex < activeSteps.length - 1
     ) {
       setStepIndex((prev) => prev + 1);
     }
@@ -169,7 +347,7 @@ export default function LiveRecordingScreen({ gameId }) {
     activeSteps.length,
     currentStepDefinition,
     currentStepKey,
-    stepIndex,
+    currentStepIndex,
     stepOptions,
     stepSelections,
   ]);
@@ -177,50 +355,188 @@ export default function LiveRecordingScreen({ gameId }) {
   const resetIncidentFlow = useCallback(() => {
     setSelectedIncidentType(null);
     setStepIndex(0);
+    setViewStepIndex(null);
     setStepSelections({});
     setNoteText('');
+    setDecisionStartSeconds(null);
+    setJustRecordedAt(null);
   }, []);
 
-  const buildDraft = useCallback(() => {
-    if (!activeIncident?.typeCode) {
-      return null;
+  const buildDraft = useCallback(
+    (selectionOverride = {}) => {
+      const merged = { ...stepSelections, ...selectionOverride };
+      const typeCode = hasEntryFlow ? merged.INCIDENT_TYPE : activeIncident?.typeCode;
+      if (!typeCode) {
+        return null;
+      }
+      const pathCodes = activeSteps
+        .flatMap((step) => {
+          if (hasEntryFlow && (step === 'OFFICIAL_ROLE' || step === 'OFFICIAL')) return [];
+          if (merged[step]) {
+            return [merged[step]];
+          }
+          const prefix = `${step}.`;
+          return Object.entries(merged)
+            .filter(([key]) => key.startsWith(prefix))
+            .map(([, value]) => value)
+            .filter(Boolean);
+        })
+        .filter(Boolean);
+      const officialCode = merged.OFFICIAL ?? merged.OFFICIAL_ROLE;
+      const iconNamesFromPath = getIconNamesFromPathCodes(pathCodes);
+      const incidentJson = {
+        ...(hasEntryFlow && officialCode && { official_role: officialCode }),
+        ...(iconNamesFromPath.length > 0 && { icon: iconNamesFromPath }),
+      };
+      const hasIncidentJson = Object.keys(incidentJson).length > 0;
+      return {
+        period: currentPeriodCode,
+        clock_second_in_period: elapsedSeconds,
+        incident_type_code: typeCode,
+        path_codes: pathCodes,
+        note_text: noteText?.trim() || null,
+        ...(hasIncidentJson && { incident_json: incidentJson }),
+      };
+    },
+    [
+      activeIncident?.typeCode,
+      activeSteps,
+      currentPeriodCode,
+      elapsedSeconds,
+      hasEntryFlow,
+      noteText,
+      stepSelections,
+    ],
+  );
+
+  const flushQueuedIncidents = useCallback(async () => {
+    if (!gameId || incidentSaveInFlightRef.current) {
+      return;
     }
-    const pathCodes = activeSteps
-      .flatMap((step) => {
-        if (stepSelections[step]) {
-          return [stepSelections[step]];
+    incidentSaveInFlightRef.current = true;
+    setIsSavingIncidents(true);
+    try {
+      const queued = await getIncidentQueue();
+      if (!queued.length) {
+        return;
+      }
+      const candidates = queued.filter((item) => item.game_id === gameId);
+      if (!candidates.length) {
+        return;
+      }
+      const inserts = [];
+      const insertedLocalIds = [];
+
+      candidates.forEach((item) => {
+        const resolvedOrgId = item.org_id ?? match?.org_id ?? null;
+        const resolvedCreatedBy = item.created_by ?? currentUserId ?? match?.created_by ?? null;
+        const resolvedGameId = item.game_id ?? gameId;
+        const clockSeconds = item.clock_second_in_period;
+
+        if (
+          !resolvedOrgId
+          || !resolvedCreatedBy
+          || !resolvedGameId
+          || !item.period
+          || !item.incident_type_code
+          || !Number.isFinite(clockSeconds)
+        ) {
+          return;
         }
-        const prefix = `${step}.`;
-        return Object.entries(stepSelections)
-          .filter(([key]) => key.startsWith(prefix))
-          .map(([, value]) => value)
-          .filter(Boolean);
-      })
-      .filter(Boolean);
-    return {
-      period: currentPeriod,
-      clock_second_in_period: elapsedSeconds,
-      incident_type_code: activeIncident.typeCode,
-      path_codes: pathCodes,
-      note_text: noteText?.trim() || null,
-    };
-  }, [activeIncident, activeSteps, currentPeriod, elapsedSeconds, noteText, stepSelections]);
+
+        inserts.push({
+          org_id: resolvedOrgId,
+          game_id: resolvedGameId,
+          created_by: resolvedCreatedBy,
+          period: item.period,
+          clock_second_in_period: clockSeconds,
+          real_world_time_utc: item.real_world_time_utc ?? item.created_at ?? new Date().toISOString(),
+          note_text: item.note_text ?? null,
+          tree_version: item.tree_version ?? treeVersion ?? null,
+          path_codes: Array.isArray(item.path_codes) ? item.path_codes : [],
+          incident_type_code: item.incident_type_code,
+          incident_json: {
+            ...(item.incident_json ?? {}),
+            client_id: item.local_id,
+          },
+        });
+        if (item.local_id) {
+          insertedLocalIds.push(item.local_id);
+        }
+      });
+
+      if (!inserts.length) {
+        return;
+      }
+
+      const { error } = await supabase.from('incidents').insert(inserts);
+      if (error) {
+        console.warn('Failed to save incidents:', error.message);
+        return;
+      }
+
+      await removeIncidentByLocalIds(insertedLocalIds);
+    } finally {
+      incidentSaveInFlightRef.current = false;
+      setIsSavingIncidents(false);
+    }
+  }, [currentUserId, gameId, match?.created_by, match?.org_id, treeVersion]);
+
+  const finalizeIncident = useCallback(async (selectionOverride = {}) => {
+    if (incidentFinalizeInFlightRef.current) {
+      return;
+    }
+    incidentFinalizeInFlightRef.current = true;
+    try {
+      const draft = buildDraft(selectionOverride);
+      if (!draft) {
+        return;
+      }
+      const queuedItem = {
+        local_id: createLocalIncidentId(),
+        created_at: new Date().toISOString(),
+        game_id: gameId ?? null,
+        org_id: match?.org_id ?? null,
+        created_by: currentUserId ?? match?.created_by ?? null,
+        tree_version: treeVersion ?? null,
+        ...draft,
+      };
+      await enqueueIncident(queuedItem);
+      resetIncidentFlow();
+    } catch (error) {
+      console.warn('Failed to queue incident:', error?.message ?? error);
+    } finally {
+      void flushQueuedIncidents();
+      incidentFinalizeInFlightRef.current = false;
+    }
+  }, [
+    buildDraft,
+    currentUserId,
+    flushQueuedIncidents,
+    gameId,
+    match?.created_by,
+    match?.org_id,
+    resetIncidentFlow,
+    treeVersion,
+  ]);
 
   const handleOptionSelect = (stepKey, optionCode) => {
+    setViewStepIndex(null);
     setStepSelections((prev) => ({ ...prev, [stepKey]: optionCode }));
-    if (stepIndex < activeSteps.length - 1) {
+
+    const hasMatchingIncidentType =
+      stepKey === 'INCIDENT_TYPE' &&
+      incidentTypes.some((t) => t.typeCode === optionCode);
+
+    if (hasMatchingIncidentType || currentStepIndex < activeSteps.length - 1) {
       setStepIndex((prev) => prev + 1);
     } else {
-      const draft = buildDraft();
-      setLastDraft(draft);
-      resetIncidentFlow();
+      void finalizeIncident({ [stepKey]: optionCode });
     }
   };
 
   const handleNoteSubmit = () => {
-    const draft = buildDraft();
-    setLastDraft(draft);
-    resetIncidentFlow();
+    void finalizeIncident();
   };
 
   const setGroupFieldValue = useCallback((stepKey, fieldKey, value) => {
@@ -231,14 +547,42 @@ export default function LiveRecordingScreen({ gameId }) {
   }, []);
 
   const handleGroupContinue = () => {
-    if (stepIndex < activeSteps.length - 1) {
+    setViewStepIndex(null);
+    if (currentStepIndex < activeSteps.length - 1) {
       setStepIndex((prev) => prev + 1);
     } else {
-      const draft = buildDraft();
-      setLastDraft(draft);
-      resetIncidentFlow();
+      void finalizeIncident();
     }
   };
+
+  useEffect(() => {
+    let isActive = true;
+    const loadSession = async () => {
+      const { data, error } = await supabase.auth.getSession();
+      if (!isActive) {
+        return;
+      }
+      if (error) {
+        console.warn('Session check failed for live recording:', error.message);
+        setCurrentUserId(null);
+      } else {
+        setCurrentUserId(data?.session?.user?.id ?? null);
+      }
+    };
+
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (isActive) {
+        setCurrentUserId(session?.user?.id ?? null);
+      }
+    });
+
+    loadSession();
+
+    return () => {
+      isActive = false;
+      authListener.subscription.unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     let isActive = true;
@@ -262,6 +606,8 @@ export default function LiveRecordingScreen({ gameId }) {
             'half_length_minutes',
             'has_extra_time',
             'extra_time_length_minutes',
+            'org_id',
+            'created_by',
             'orgs(sport_id)',
           ].join(','),
         )
@@ -287,6 +633,41 @@ export default function LiveRecordingScreen({ gameId }) {
     };
   }, [gameId]);
 
+  useEffect(() => {
+    let isActive = true;
+    const sportId = match?.orgs?.sport_id;
+    if (!sportId) {
+      setSportRules(null);
+      return () => {
+        isActive = false;
+      };
+    }
+
+    const loadRules = async () => {
+      const { data, error } = await supabase
+        .from('sports')
+        .select(['id', 'rules'].join(','))
+        .eq('id', sportId)
+        .maybeSingle();
+
+      if (!isActive) {
+        return;
+      }
+      if (error) {
+        console.warn('Failed to load sport rules:', error.message);
+        setSportRules(null);
+      } else {
+        setSportRules(data?.rules ?? null);
+      }
+    };
+
+    void loadRules();
+
+    return () => {
+      isActive = false;
+    };
+  }, [match?.orgs?.sport_id]);
+
   const loadTree = useCallback(async () => {
     const sportId = match?.orgs?.sport_id;
     if (!sportId) {
@@ -306,8 +687,10 @@ export default function LiveRecordingScreen({ gameId }) {
     if (error) {
       console.warn('Failed to load sport tree:', error.message);
       setTree(null);
+      setTreeVersion(null);
     } else {
       setTree(data?.tree_json ?? null);
+      setTreeVersion(data?.version ?? null);
     }
     setIsLoadingTree(false);
   }, [match]);
@@ -330,10 +713,11 @@ export default function LiveRecordingScreen({ gameId }) {
           'path_codes',
           'note_text',
           'created_at',
+          'incident_json',
         ].join(','),
       )
       .eq('game_id', gameId)
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: true });
 
     if (error) {
       console.warn('Failed to load incidents:', error.message);
@@ -351,6 +735,10 @@ export default function LiveRecordingScreen({ gameId }) {
   useEffect(() => {
     void loadIncidents();
   }, [loadIncidents]);
+
+  useEffect(() => {
+    void flushQueuedIncidents();
+  }, [flushQueuedIncidents]);
 
   useEffect(() => {
     if (!gameId) {
@@ -387,48 +775,102 @@ export default function LiveRecordingScreen({ gameId }) {
   }, [timerRunning]);
 
   useEffect(() => {
-    if (!timerRunning || !halfLengthSeconds) {
+    if (!timerRunning || !currentPeriodLengthSeconds) {
       return;
     }
-    if (elapsedSeconds >= halfLengthSeconds) {
-      setElapsedSeconds(halfLengthSeconds);
+    if (elapsedSeconds >= currentPeriodLengthSeconds) {
+      setElapsedSeconds(currentPeriodLengthSeconds);
       setTimerRunning(false);
     }
-  }, [elapsedSeconds, halfLengthSeconds, timerRunning]);
+  }, [elapsedSeconds, currentPeriodLengthSeconds, timerRunning]);
 
-  const handleStart = () => {
-    if (!halfLengthSeconds) {
-      Alert.alert('Missing half length', 'Set a half length before recording.');
+  useEffect(() => {
+    if (!periodSequence.length) {
       return;
     }
-    setIsLive(true);
-    setTimerRunning(true);
+    if (periodIndex >= periodSequence.length) {
+      setPeriodIndex(0);
+    }
+  }, [periodIndex, periodSequence.length]);
+
+  const handleStart = () => {
+    if (currentPeriodClockRunning && !currentPeriodLengthSeconds) {
+      Alert.alert('Missing period length', 'Set a period length before recording.');
+      return;
+    }
+    setPeriodIndex(0);
+    setElapsedSeconds(0);
+    setRecordingStatus('live');
+    setTimerRunning(currentPeriodClockRunning);
   };
 
+  const handleStartNextPeriod = useCallback(() => {
+    if (!nextPeriod) {
+      setRecordingStatus('finished');
+      setTimerRunning(false);
+      return;
+    }
+    if (nextPeriodClockRunning && !nextPeriodLengthSeconds) {
+      Alert.alert('Missing period length', 'Set a period length before recording.');
+      return;
+    }
+    setPeriodIndex((prev) => prev + 1);
+    setElapsedSeconds(0);
+    setRecordingStatus('live');
+    setTimerRunning(nextPeriodClockRunning);
+  }, [nextPeriod, nextPeriodClockRunning, nextPeriodLengthSeconds]);
+
+  const completeMatchAndNavigate = useCallback(async () => {
+    if (!gameId) {
+      return;
+    }
+    const { error } = await supabase
+      .from('games')
+      .update({ status: 'complete' })
+      .eq('id', gameId);
+
+    if (error) {
+      console.warn('Failed to complete game:', error.message);
+    }
+
+    setTimerRunning(false);
+    setRecordingStatus('finished');
+    router.replace({ pathname: '/preliminary-report', params: { gameId } });
+  }, [gameId]);
+
   const confirmEndHalf = useCallback(() => {
+    const hasNextPeriod = Boolean(nextPeriod);
     Alert.alert(
-      'End half',
-      'Do you want to continue recording or end the half?',
+      hasNextPeriod ? 'End period' : 'End match',
+      hasNextPeriod
+        ? 'Do you want to continue recording or end the period?'
+        : 'Do you want to end the match?',
       [
         { text: 'Continue recording', style: 'cancel' },
         {
-          text: 'End half',
+          text: hasNextPeriod ? 'End period' : 'End match',
           style: 'destructive',
           onPress: () => {
-            setTimerRunning(false);
+            if (hasNextPeriod) {
+              setTimerRunning(false);
+              setRecordingStatus('break');
+            } else {
+              void completeMatchAndNavigate();
+            }
           },
         },
       ],
     );
-  }, []);
+  }, [nextPeriod, completeMatchAndNavigate]);
 
   const handleMoreOptions = useCallback(() => {
     Alert.alert('Recording options', 'Choose an action', [
       {
-        text: 'Restart half',
+        text: `Restart ${currentPeriodLabel}`,
         onPress: () => {
           setElapsedSeconds(0);
-          setTimerRunning(true);
+          setRecordingStatus('live');
+          setTimerRunning(currentPeriodClockRunning);
         },
       },
       {
@@ -436,13 +878,13 @@ export default function LiveRecordingScreen({ gameId }) {
         onPress: () => setTimerRunning(false),
       },
       {
-        text: 'End half',
+        text: `End ${currentPeriodLabel}`,
         style: 'destructive',
         onPress: confirmEndHalf,
       },
       { text: 'Cancel', style: 'cancel' },
     ]);
-  }, [confirmEndHalf]);
+  }, [confirmEndHalf, currentPeriodClockRunning, currentPeriodLabel]);
 
   const renderHeader = () => (
     <MatchHeaderContainer>
@@ -452,8 +894,21 @@ export default function LiveRecordingScreen({ gameId }) {
         <Text style={styles.headerTeam}>{match?.away_team ?? 'Away team'}</Text>
       </View>
       <View style={styles.headerRight}>
-        <Text style={styles.headerHalfLabel}>{periodLabel}</Text>
-        <Text style={styles.headerTimer}>{FORMAT_CLOCK(elapsedSeconds)}</Text>
+        {recordingStatus === 'break' ? (
+          <>
+            <Text style={styles.headerHalfLabel}>Break</Text>
+            <Pressable style={styles.headerBreakButton} onPress={handleStartNextPeriod}>
+              <Text style={styles.headerBreakButtonText}>
+                {nextPeriod?.label ? `Start ${nextPeriod.label}` : 'Start next period'}
+              </Text>
+            </Pressable>
+          </>
+        ) : (
+          <>
+            <Text style={styles.headerHalfLabel}>{currentPeriodLabel}</Text>
+            <Text style={styles.headerTimer}>{FORMAT_CLOCK(elapsedSeconds)}</Text>
+          </>
+        )}
       </View>
     </MatchHeaderContainer>
   );
@@ -489,8 +944,10 @@ export default function LiveRecordingScreen({ gameId }) {
               style={[styles.incidentTypeButton, shouldStretch && styles.optionStretch]}
               onPress={() => {
                 void impactAsync(ImpactFeedbackStyle.Medium);
+                setDecisionStartSeconds((prev) => prev ?? elapsedSeconds);
                 setSelectedIncidentType(type.typeCode);
                 setStepIndex(0);
+                setViewStepIndex(null);
                 setStepSelections({});
                 setNoteText('');
               }}
@@ -499,7 +956,7 @@ export default function LiveRecordingScreen({ gameId }) {
             </Pressable>
           ))}
         </View>
-        {!incidentTypes.length && !isLoadingTree ? (
+        {!incidentTypes.length && !hasEntryFlow && !isLoadingTree ? (
           <Text style={styles.emptyText}>No decision tree available.</Text>
         ) : null}
       </View>
@@ -523,11 +980,16 @@ export default function LiveRecordingScreen({ gameId }) {
             multiline
             autoFocus
           />
-          <PrimaryButton title="Finish" onPress={handleNoteSubmit} style={styles.finishButton} />
-          {stepIndex > 0 ? (
+          <PrimaryButton
+            title="Finish"
+            onPress={handleNoteSubmit}
+            style={styles.finishButton}
+            disabled={isSavingIncidents}
+          />
+          {currentStepIndex > 0 ? (
             <Pressable
               style={styles.backButton}
-              onPress={() => setStepIndex((prev) => Math.max(0, prev - 1))}
+              onPress={() => setViewStepIndex(Math.max(0, currentStepIndex - 1))}
             >
               <Text style={styles.backButtonText}>Back</Text>
             </Pressable>
@@ -630,10 +1092,10 @@ export default function LiveRecordingScreen({ gameId }) {
             style={[styles.finishButton, !isComplete && styles.choiceButtonDisabled]}
             disabled={!isComplete}
           />
-          {stepIndex > 0 ? (
+          {currentStepIndex > 0 ? (
             <Pressable
               style={styles.backButton}
-              onPress={() => setStepIndex((prev) => Math.max(0, prev - 1))}
+              onPress={() => setViewStepIndex(Math.max(0, currentStepIndex - 1))}
             >
               <Text style={styles.backButtonText}>Back</Text>
             </Pressable>
@@ -691,10 +1153,10 @@ export default function LiveRecordingScreen({ gameId }) {
         })}
         </View>
         {!stepOptions.length ? <Text style={styles.emptyText}>No options available.</Text> : null}
-        {stepIndex > 0 ? (
+        {currentStepIndex > 0 ? (
           <Pressable
             style={styles.backButton}
-            onPress={() => setStepIndex((prev) => Math.max(0, prev - 1))}
+            onPress={() => setViewStepIndex(Math.max(0, currentStepIndex - 1))}
           >
             <Text style={styles.backButtonText}>Back</Text>
           </Pressable>
@@ -709,37 +1171,46 @@ export default function LiveRecordingScreen({ gameId }) {
 
   const renderRecordTab = () => (
     <View>
-      {selectedIncidentType ? renderStep() : renderIncidentTypes()}
-      {lastDraft ? (
-        <View style={styles.draftCard}>
-          <Text style={styles.draftTitle}>Last incident draft</Text>
-          <Text style={styles.draftText}>
-            {lastDraft.incident_type_code} · {FORMAT_CLOCK(lastDraft.clock_second_in_period)}
-          </Text>
+      {recordingStatus === 'break' ? (
+        <View style={styles.breakContainer}>
+          <Pressable style={styles.startButton} onPress={handleStartNextPeriod}>
+            <Text style={styles.startButtonText}>
+              {nextPeriod?.label ? `start ${nextPeriod.label}` : 'start next period'}
+            </Text>
+          </Pressable>
         </View>
+      ) : null}
+      {recordingStatus === 'finished' ? (
+        <View style={styles.statusCard}>
+          <Text style={styles.statusTitle}>Match complete</Text>
+          <Text style={styles.statusText}>All periods are finished.</Text>
+        </View>
+      ) : null}
+      {recordingStatus === 'live' ? (
+        <>
+          {breadcrumbItems.length ? (
+            <View style={styles.breadcrumbRow}>
+              {breadcrumbItems.map((item, index) => (
+                <View key={`${item}-${index}`} style={styles.breadcrumbPill}>
+                  <Text style={styles.breadcrumbText}>{item}</Text>
+                </View>
+              ))}
+            </View>
+          ) : null}
+          {hasEntryFlow || selectedIncidentType ? renderStep() : renderIncidentTypes()}
+        </>
       ) : null}
     </View>
   );
 
   const renderRunsheet = () => (
-    <View>
-      {incidents.map((incident) => (
-        <View key={incident.id} style={styles.incidentRow}>
-          <View>
-            <Text style={styles.incidentType}>{incident.incident_type_code}</Text>
-            <Text style={styles.incidentMeta}>
-              {incident.period} · {FORMAT_CLOCK(incident.clock_second_in_period)}
-            </Text>
-          </View>
-          <Text style={styles.incidentPath}>
-            {(incident.path_codes ?? []).join(' > ')}
-          </Text>
-        </View>
-      ))}
-      {!incidents.length && !isLoadingIncidents ? (
-        <Text style={styles.emptyText}>No incidents recorded yet.</Text>
-      ) : null}
-    </View>
+    <RunsheetView
+      incidents={incidents}
+      periodSequence={periodSequence}
+      tree={tree}
+      isLoading={isLoadingIncidents}
+      emptyText="No incidents recorded yet."
+    />
   );
 
   return (
@@ -748,10 +1219,14 @@ export default function LiveRecordingScreen({ gameId }) {
       {!isLive ? (
         <View style={styles.startBody}>
           <Text style={styles.startLabel}>
-            Start the match to start recording incidents.
+            {currentPeriodLabel
+              ? `Start ${currentPeriodLabel} to start recording incidents.`
+              : 'Start the match to start recording incidents.'}
           </Text>
           <Pressable style={styles.startButton} onPress={handleStart}>
-            <Text style={styles.startButtonText}>start</Text>
+            <Text style={styles.startButtonText}>
+              {currentPeriodLabel ? `start ${currentPeriodLabel}` : 'start'}
+            </Text>
           </Pressable>
         </View>
       ) : (
@@ -764,7 +1239,7 @@ export default function LiveRecordingScreen({ gameId }) {
           {activeTab === 'record' ? renderRecordTab() : renderRunsheet()}
         </ScrollView>
       )}
-      {isLive ? (
+      {recordingStatus === 'live' ? (
         <View style={styles.fabContainer}>
           <Pressable
             style={[styles.fab, styles.fabOptions]}
@@ -822,6 +1297,18 @@ const styles = StyleSheet.create({
     color: colors.ivory,
     ...typography.title.large,
   },
+  headerBreakButton: {
+    height: 36,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    backgroundColor: colors.racing,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerBreakButtonText: {
+    color: colors.ivory,
+    ...typography.ui.cta,
+  },
   headerHalfLabel: {
     color: colors.softBlack,
     ...typography.label.small,
@@ -863,12 +1350,50 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     ...typography.title.large,
   },
+  statusCard: {
+    alignItems: 'center',
+    backgroundColor: colors.softGrey,
+    borderRadius: 16,
+    gap: spacing[12],
+    marginBottom: spacing[16],
+    padding: spacing[16],
+  },
+  statusTitle: {
+    color: colors.black,
+    ...typography.title.medium,
+  },
+  statusText: {
+    color: colors.softBlack,
+    textAlign: 'center',
+    ...typography.label.medium,
+  },
+  breakContainer: {
+    alignItems: 'center',
+    marginBottom: spacing[16],
+  },
   segmented: {
     flexDirection: 'row',
     backgroundColor: colors.softGrey,
     borderRadius: 12,
     padding: spacing[4],
     marginBottom: spacing[16],
+  },
+  breadcrumbRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: spacing[8],
+    marginBottom: spacing[16],
+  },
+  breadcrumbPill: {
+    paddingVertical: spacing[4],
+    paddingHorizontal: spacing[8],
+    borderRadius: 9999,
+    backgroundColor: colors.iceGrey,
+    alignSelf: 'flex-start',
+  },
+  breadcrumbText: {
+    color: colors.black,
+    ...typography.ui.chip,
   },
   segment: {
     flex: 1,
@@ -988,38 +1513,6 @@ const styles = StyleSheet.create({
   emptyText: {
     color: colors.darkGrey,
     marginTop: spacing[12],
-    ...typography.paragraph.small,
-  },
-  incidentRow: {
-    paddingVertical: spacing[12],
-    borderBottomWidth: 1,
-    borderBottomColor: colors.iceGrey,
-    gap: spacing[4],
-  },
-  incidentType: {
-    color: colors.black,
-    ...typography.label.large,
-  },
-  incidentMeta: {
-    color: colors.softBlack,
-    ...typography.label.small,
-  },
-  incidentPath: {
-    color: colors.darkGrey,
-    ...typography.paragraph.small,
-  },
-  draftCard: {
-    padding: spacing[12],
-    borderRadius: 12,
-    backgroundColor: colors.softGrey,
-  },
-  draftTitle: {
-    color: colors.black,
-    marginBottom: spacing[4],
-    ...typography.label.small,
-  },
-  draftText: {
-    color: colors.softBlack,
     ...typography.paragraph.small,
   },
   fabContainer: {

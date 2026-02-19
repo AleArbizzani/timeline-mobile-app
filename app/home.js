@@ -883,7 +883,7 @@ export default function HomeScreen() {
     .filter((game) => game.dateTime > now && game.status !== 'complete')
     .sort((a, b) => a.dateTime - b.dateTime);
   const pastMatches = gamesWithDateTime
-    .filter((game) => game.dateTime < now)
+    .filter((game) => game.status === 'complete' || game.dateTime < now)
     .sort((a, b) => b.dateTime - a.dateTime);
   const showGamesSkeleton = gamesLoading && games.length === 0;
   const skeletonSectionData = useMemo(

@@ -124,7 +124,7 @@ No interpretation or business logic is applied here.
 |------|------|
 | id | uuid |
 | org_id | uuid |
-| game_id | uuid |
+| game_id | uuid |rr
 | created_by | uuid |
 | period | text |
 | clock_second_in_period | bigint |
@@ -279,6 +279,7 @@ No interpretation or business logic is applied here.
 | code | text |
 | name | text |
 | created_at | timestamptz |
+| rules | jsonb |
 
 ---
 

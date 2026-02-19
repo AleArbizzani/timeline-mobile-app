@@ -1,0 +1,7 @@
+# Supabase project configuration
+# See: https://supabase.com/docs/guides/cli/config
+
+[functions.generate-preliminary-report]
+# Disable JWT verification to work around Supabase gateway 401 with ES256 tokens.
+# This function does not access the database or use RLS.
+verify_jwt = false
