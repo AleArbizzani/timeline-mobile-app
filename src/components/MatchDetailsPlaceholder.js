@@ -1,8 +1,21 @@
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Alert,
+  Animated,
+  Keyboard,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
-import { MatchHeaderContainer } from './headers';
+import { MatchHeaderContainer, ModalHeader } from './headers';
 import GameCard from './GameCard';
 import PrimaryButton from './PrimaryButton';
 import RunsheetView from './RunsheetView';
@@ -93,60 +106,54 @@ export default function MatchDetailsPlaceholder({ gameId, onBack }) {
   const [isLoadingIncidents, setIsLoadingIncidents] = useState(false);
   const [tree, setTree] = useState(null);
   const [sportRules, setSportRules] = useState(null);
+  const [editOfficial, setEditOfficial] = useState(null);
+  const [editText, setEditText] = useState('');
+  const [isSavingEdit, setIsSavingEdit] = useState(false);
+  const [toastVisible, setToastVisible] = useState(false);
+  const toastAnim = useRef(new Animated.Value(0)).current;
+  const toastTimerRef = useRef(null);
+
+  const loadMatch = useCallback(async () => {
+    setIsLoading(true);
+    if (!gameId) {
+      setMatch(null);
+      setIsLoading(false);
+      return;
+    }
+    const { data, error } = await supabase
+      .from('games')
+      .select(
+        [
+          'id',
+          'status',
+          'game_date',
+          'kickoff_time',
+          'home_team',
+          'away_team',
+          'competition',
+          'ground',
+          'half_length_minutes',
+          'has_extra_time',
+          'extra_time_length_minutes',
+          'orgs(name, sport_id)',
+          'game_officials(id, role, officials(full_name), reports(id, report_section_entries(id), report_ai_drafts(id, generated_text, generated_at, model_name)))',
+        ].join(','),
+      )
+      .eq('id', gameId)
+      .maybeSingle();
+
+    if (error) {
+      console.warn('Failed to load match details:', error.message);
+      setMatch(null);
+    } else {
+      setMatch(data ?? null);
+    }
+    setIsLoading(false);
+  }, [gameId]);
 
   useEffect(() => {
-    let isActive = true;
-
-    const loadMatch = async () => {
-      setIsLoading(true);
-      if (!gameId) {
-        if (isActive) {
-          setMatch(null);
-          setIsLoading(false);
-        }
-        return;
-      }
-      const { data, error } = await supabase
-        .from('games')
-        .select(
-          [
-            'id',
-            'status',
-            'game_date',
-            'kickoff_time',
-            'home_team',
-            'away_team',
-            'competition',
-            'ground',
-            'half_length_minutes',
-            'has_extra_time',
-            'extra_time_length_minutes',
-            'orgs(name, sport_id)',
-            'game_officials(id, role, officials(full_name), reports(id, report_section_entries(id)))',
-          ].join(','),
-        )
-        .eq('id', gameId)
-        .maybeSingle();
-
-      if (!isActive) {
-        return;
-      }
-      if (error) {
-        console.warn('Failed to load match details:', error.message);
-        setMatch(null);
-        setIsLoading(false);
-        return;
-      }
-      setMatch(data ?? null);
-      setIsLoading(false);
-    };
-
     void loadMatch();
-
-    return () => {
-      isActive = false;
-    };
-  }, [gameId]);
+  }, [loadMatch]);
 
   useEffect(() => {
     let isActive = true;
@@ -322,15 +329,137 @@ export default function MatchDetailsPlaceholder({ gameId, onBack }) {
         const report = Array.isArray(entry.reports) ? entry.reports[0] : entry.reports;
         const hasContent =
           report?.report_section_entries?.length > 0;
+        const drafts = report?.report_ai_drafts ?? [];
+        const sortedDrafts = Array.isArray(drafts)
+          ? [...drafts].sort(
+              (a, b) =>
+                new Date(b.generated_at || 0).getTime() -
+                new Date(a.generated_at || 0).getTime(),
+            )
+          : [];
+        const latestDraft = sortedDrafts[0];
+        const draftText = latestDraft?.generated_text ?? null;
+        const draftId = latestDraft?.id ?? null;
         return {
           id: entry.id,
           roleLabel,
           name: entry.officials.full_name,
           hasContent,
           reportId: report?.id,
+          draftText,
+          draftId,
         };
       });
   }, [match]);
+
+  const isEditDirty = editOfficial && editText !== (editOfficial.draftText ?? '');
+
+  const hideToast = useCallback(() => {
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+    toastAnim.stopAnimation();
+    Animated.timing(toastAnim, {
+      toValue: 0,
+      duration: 220,
+      useNativeDriver: true,
+    }).start(({ finished }) => {
+      if (finished) setToastVisible(false);
+    });
+  }, [toastAnim]);
+
+  const showToast = useCallback(() => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToastVisible(true);
+    toastAnim.stopAnimation();
+    Animated.timing(toastAnim, {
+      toValue: 1,
+      duration: 220,
+      useNativeDriver: true,
+    }).start();
+    toastTimerRef.current = setTimeout(hideToast, 5000);
+  }, [toastAnim, hideToast]);
+
+  const openEditModal = useCallback((official) => {
+    setEditOfficial(official);
+    setEditText(official?.draftText ?? '');
+  }, []);
+
+  const closeEditModalWithoutSaving = useCallback(() => {
+    setEditOfficial(null);
+    setEditText('');
+    Keyboard.dismiss();
+  }, []);
+
+  const confirmCloseEditModal = useCallback(() => {
+    if (!isEditDirty) {
+      closeEditModalWithoutSaving();
+      return;
+    }
+    Alert.alert('Do you want to save your changes?', undefined, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Discard', style: 'destructive', onPress: closeEditModalWithoutSaving },
+      {
+        text: 'Save',
+        onPress: async () => {
+          if (!editOfficial?.draftId) {
+            closeEditModalWithoutSaving();
+            return;
+          }
+          setIsSavingEdit(true);
+          try {
+            const { error } = await supabase
+              .from('report_ai_drafts')
+              .update({
+                generated_text: editText,
+                coach_edits: true,
+              })
+              .eq('id', editOfficial.draftId);
+            if (error) throw error;
+            await loadMatch();
+            closeEditModalWithoutSaving();
+            showToast();
+          } catch (err) {
+            console.warn('Failed to save edit:', err);
+            Alert.alert('Save failed', err?.message ?? 'Could not save changes.');
+          } finally {
+            setIsSavingEdit(false);
+          }
+        },
+      },
+    ]);
+  }, [
+    isEditDirty,
+    editOfficial,
+    editText,
+    closeEditModalWithoutSaving,
+    loadMatch,
+    showToast,
+  ]);
+
+  const handleSaveEdit = useCallback(async () => {
+    if (!editOfficial?.draftId) return;
+    setIsSavingEdit(true);
+    try {
+      const { error } = await supabase
+        .from('report_ai_drafts')
+        .update({
+          generated_text: editText,
+          coach_edits: true,
+        })
+        .eq('id', editOfficial.draftId);
+      if (error) throw error;
+      await loadMatch();
+      closeEditModalWithoutSaving();
+      showToast();
+    } catch (err) {
+      console.warn('Failed to save edit:', err);
+      Alert.alert('Save failed', err?.message ?? 'Could not save changes.');
+    } finally {
+      setIsSavingEdit(false);
+    }
+  }, [editOfficial, editText, loadMatch, showToast, closeEditModalWithoutSaving]);
 
   const renderSegmentedControl = () => (
     <View style={styles.segmented}>
@@ -417,7 +546,9 @@ export default function MatchDetailsPlaceholder({ gameId, onBack }) {
           <Pressable
             style={styles.reportCardBody}
             onPress={() => {
-              if (!official.hasContent) {
+              if (official.draftText && official.draftId) {
+                openEditModal(official);
+              } else if (!official.hasContent) {
                 router.push({
                   pathname: '/report/create',
                   params: { gameId, gameOfficialId: official.id },
@@ -425,7 +556,9 @@ export default function MatchDetailsPlaceholder({ gameId, onBack }) {
               }
             }}
           >
-            {official.hasContent ? (
+            {official.draftText ? (
+              <Text style={styles.reportCardDraftText}>{official.draftText}</Text>
+            ) : official.hasContent ? (
               <Text style={styles.reportCardPlaceholder}>Report content coming soon.</Text>
             ) : (
               <Text style={styles.reportCardEmpty}>Start a report</Text>
@@ -536,6 +669,64 @@ export default function MatchDetailsPlaceholder({ gameId, onBack }) {
             }}
           />
         </View>
+      ) : null}
+      <Modal
+        visible={Boolean(editOfficial)}
+        animationType="slide"
+        onRequestClose={confirmCloseEditModal}
+      >
+        <KeyboardAvoidingView
+          style={styles.editModalScreen}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        >
+          <ModalHeader
+            title={editOfficial ? `${editOfficial.roleLabel} ${editOfficial.name}` : ''}
+            onClose={confirmCloseEditModal}
+            onSave={handleSaveEdit}
+            saveDisabled={isSavingEdit}
+          />
+          <ScrollView
+            style={styles.editModalContent}
+            contentContainerStyle={styles.editModalContentContainer}
+            keyboardShouldPersistTaps="handled"
+            automaticallyAdjustKeyboardInsets
+          >
+            <TextInput
+              style={styles.editModalInput}
+              value={editText}
+              onChangeText={setEditText}
+              placeholder="Edit preliminary report..."
+              placeholderTextColor={colors.darkGrey}
+              multiline
+              textAlignVertical="top"
+              autoFocus
+            />
+          </ScrollView>
+        </KeyboardAvoidingView>
+      </Modal>
+      {toastVisible ? (
+        <Animated.View
+          style={[
+            styles.toastWrapper,
+            {
+              opacity: toastAnim,
+              transform: [
+                {
+                  translateY: toastAnim.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: [spacing[24], 0],
+                  }),
+                },
+              ],
+            },
+          ]}
+          pointerEvents="box-none"
+        >
+          <Pressable style={styles.toast} onPress={hideToast}>
+            <Text style={styles.toastText}>Changes saved successfully</Text>
+            <Ionicons name="close-sharp" size={16} color={colors.ivory} />
+          </Pressable>
+        </Animated.View>
       ) : null}
     </View>
   );
@@ -725,6 +916,51 @@ const styles = StyleSheet.create({
   reportCardPlaceholder: {
     color: colors.softBlack,
     ...typography.paragraph.medium,
+  },
+  reportCardDraftText: {
+    ...typography.paragraph.small,
+    color: colors.black,
+    lineHeight: 22,
+  },
+  editModalScreen: {
+    flex: 1,
+    backgroundColor: colors.ivory,
+  },
+  editModalContent: {
+    flex: 1,
+  },
+  editModalContentContainer: {
+    paddingHorizontal: spacing[16],
+    paddingTop: spacing[24],
+    paddingBottom: spacing[24],
+    flexGrow: 0,
+  },
+  editModalInput: {
+    ...typography.paragraph.large,
+    color: colors.black,
+    minHeight: 200,
+  },
+  toastWrapper: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: spacing[64] + spacing[24],
+    paddingHorizontal: spacing[16],
+    alignItems: 'stretch',
+  },
+  toast: {
+    backgroundColor: colors.forest,
+    borderRadius: spacing[4],
+    padding: spacing[12],
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    columnGap: spacing[12],
+  },
+  toastText: {
+    ...typography.label.medium,
+    color: colors.ivory,
+    flex: 1,
   },
   ctaContainer: {
     position: 'absolute',

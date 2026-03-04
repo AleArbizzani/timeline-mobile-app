@@ -39,6 +39,12 @@ export const typography = {
     },
   },
   paragraph: {
+    large: {
+      fontFamily: 'Inter_400Regular',
+      fontWeight: '400',
+      fontSize: 18,
+      lineHeight: 28,
+    },
     medium: {
       fontFamily: 'Inter_400Regular',
       fontWeight: '400',

@@ -19,7 +19,8 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.timeline.app"
     },
     "android": {
       "adaptiveIcon": {

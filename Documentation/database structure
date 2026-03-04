@@ -207,6 +207,7 @@ No interpretation or business logic is applied here.
 | generated_at | timestamptz |
 | model_name | text |
 | input_hash | text |
+| coach_edits | bool |
 
 ---
 
